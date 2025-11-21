@@ -5,6 +5,7 @@ import igl
 import numpy as np
 import polyscope as ps
 import polyscope.imgui as psim
+import time
 
 
 def mesh_to_unit_bounds(V: np.ndarray, bound_half_extent: float = 0.5) -> np.ndarray:
@@ -138,7 +139,7 @@ def apply_partitioned_ifs(
 
 
 def main() -> None:
-    dims = (32, 32, 32)
+    dims = (64, 64, 64)
     bound_low = (-0.5, -0.5, -0.5)
     bound_high = (0.5, 0.5, 0.5)
 
@@ -156,7 +157,11 @@ def main() -> None:
     sdf = distances.reshape(dims)
 
     iter_grid = np.random.uniform(-1.0, 1.0, size=dims)
-    state: Dict[str, Any] = {"mapping": None, "iter_grid": iter_grid}
+    state: Dict[str, Any] = {
+        "mapping": None,
+        "iter_grid": iter_grid,
+        "last_compress_ms": None,
+    }
 
     ps.init()
     ps_grid = ps.register_volume_grid("spot sdf", dims, bound_low, bound_high)
@@ -188,12 +193,15 @@ def main() -> None:
 
     def ui_callback() -> None:
         if psim.Button("Compress"):
+            start = time.perf_counter()
             state["mapping"] = compute_partitioned_ifs(
                 sdf,
                 range_block_size=4,
                 domain_block_size=8,
             )
-            print("Computed partitioned IFS mapping.")
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            state["last_compress_ms"] = elapsed_ms
+            print(f"Computed partitioned IFS mapping in {elapsed_ms:.2f} ms.")
 
         if psim.Button("Iterate once"):
             if state["mapping"] is None:
@@ -209,6 +217,11 @@ def main() -> None:
             state["iter_grid"] = np.random.uniform(-1.0, 1.0, size=dims)
             update_iter_visual(enabled=True)
             print("Reset iter grid.")
+
+        if state["last_compress_ms"] is None:
+            psim.Text("Last compress: (not run yet)")
+        else:
+            psim.Text(f"Last compress: {state['last_compress_ms']:.2f} ms")
 
     ps.set_user_callback(ui_callback)
     ps.show()
