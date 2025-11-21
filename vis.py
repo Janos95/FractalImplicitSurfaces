@@ -161,6 +161,8 @@ def main() -> None:
         "mapping": None,
         "iter_grid": iter_grid,
         "last_compress_ms": None,
+        "last_mse": None,
+        "last_max_err": None,
     }
 
     ps.init()
@@ -211,17 +213,31 @@ def main() -> None:
                     state["iter_grid"], state["mapping"]
                 )
                 update_iter_visual(enabled=True)
-                print("Applied mapping once.")
+                diff = state["iter_grid"] - sdf
+                state["last_mse"] = float(np.mean(diff ** 2))
+                state["last_max_err"] = float(np.max(np.abs(diff)))
 
         if psim.Button("Reset"):
             state["iter_grid"] = np.random.uniform(-1.0, 1.0, size=dims)
             update_iter_visual(enabled=True)
+            state["last_mse"] = None
+            state["last_max_err"] = None
             print("Reset iter grid.")
 
         if state["last_compress_ms"] is None:
             psim.Text("Last compress: (not run yet)")
         else:
             psim.Text(f"Last compress: {state['last_compress_ms']:.2f} ms")
+
+        if state["last_mse"] is None:
+            psim.Text("Last MSE to sdf: (not computed)")
+        else:
+            psim.Text(f"Last MSE to sdf: {state['last_mse']:.3e}")
+
+        if state["last_max_err"] is None:
+            psim.Text("Last max |err| to sdf: (not computed)")
+        else:
+            psim.Text(f"Last max |err| to sdf: {state['last_max_err']:.3e}")
 
     ps.set_user_callback(ui_callback)
     ps.show()
