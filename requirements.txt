@@ -1,0 +1,3 @@
+libigl==2.6.1
+numpy==2.3.5
+polyscope==2.5.0
