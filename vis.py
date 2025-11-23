@@ -8,6 +8,9 @@ import numpy as np
 import polyscope as ps
 import polyscope.imgui as psim
 import time
+import torch
+
+from train import GRID_SIZE as NN_GRID_SIZE, collage_once as neural_collage_once, load_model
 
 # 24 proper rotations (no reflections) of the cube as axis permutations with sign flips.
 def _generate_cube_rotations() -> List[Tuple[Tuple[int, int, int], Tuple[int, int, int]]]:
@@ -234,6 +237,9 @@ def main(mesh_path: Path) -> None:
     bound_low = (-0.5, -0.5, -0.5)
     bound_high = (0.5, 0.5, 0.5)
 
+    if dims[0] != NN_GRID_SIZE:
+        raise ValueError(f"Neural PIFS grid size ({NN_GRID_SIZE}) does not match viewer grid ({dims[0]}).")
+
     if not mesh_path.exists():
         raise FileNotFoundError(f"Mesh not found: {mesh_path}")
 
@@ -256,7 +262,9 @@ def main(mesh_path: Path) -> None:
         "last_compress_ms": None,
         "last_mse": None,
         "last_max_err": None,
+        "neural_model": None,
     }
+    neural_checkpoint = Path(__file__).resolve().parent / "fractal_attention_sdf.pt"
 
     ps.init()
     ps_grid = ps.register_volume_grid("spot sdf", dims, bound_low, bound_high)
@@ -312,7 +320,15 @@ def main(mesh_path: Path) -> None:
             )
             print(f"Saved fractal code to {save_path}")
 
-        if psim.Button("Iterate once"):
+        if psim.Button("Reset"):
+            state["iter_grid"] = np.random.uniform(-1.0, 1.0, size=dims)
+            update_iter_visual(enabled=True)
+            state["last_mse"] = None
+            state["last_max_err"] = None
+            print("Reset iter grid.")
+
+        psim.Separator()
+        if psim.Button("Iterate classical"):
             if state["mapping"] is None:
                 print("Please run Compress before iterating.")
             else:
@@ -323,14 +339,30 @@ def main(mesh_path: Path) -> None:
                 diff = state["iter_grid"] - sdf
                 state["last_mse"] = float(np.mean(diff ** 2))
                 state["last_max_err"] = float(np.max(np.abs(diff)))
-                print(f"Applied iteration. MSE: {state['last_mse']:.6f}")
+                print(f"Applied classical iteration. MSE: {state['last_mse']:.6f}")
 
-        if psim.Button("Reset"):
-            state["iter_grid"] = np.random.uniform(-1.0, 1.0, size=dims)
-            update_iter_visual(enabled=True)
-            state["last_mse"] = None
-            state["last_max_err"] = None
-            print("Reset iter grid.")
+        if psim.Button("Iterate neural"):
+            if not neural_checkpoint.exists():
+                print(f"Neural checkpoint not found at {neural_checkpoint}; ignoring button press.")
+            else:
+                if state["neural_model"] is None:
+                    try:
+                        state["neural_model"] = load_model(neural_checkpoint, map_location="cpu")
+                        print(f"Loaded neural model from {neural_checkpoint}")
+                    except Exception as exc:
+                        state["neural_model"] = None
+                        print(f"Failed to load neural model: {exc}")
+
+                if state["neural_model"] is not None:
+                    grid_t = torch.from_numpy(state["iter_grid"]).to(torch.float32)
+                    with torch.no_grad():
+                        updated = neural_collage_once(state["neural_model"], grid_t)
+                    state["iter_grid"] = updated.cpu().numpy()
+                    update_iter_visual(enabled=True)
+                    diff = state["iter_grid"] - sdf
+                    state["last_mse"] = float(np.mean(diff ** 2))
+                    state["last_max_err"] = float(np.max(np.abs(diff)))
+                    print(f"Applied neural iteration. MSE: {state['last_mse']:.6f}")
 
         psim.Separator()
         if state["last_compress_ms"] is None:
