@@ -1,13 +1,22 @@
 import argparse
 from itertools import permutations, product
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple, Optional
 
 import igl
 import numpy as np
 import polyscope as ps
 import polyscope.imgui as psim
 import time
+
+# Optional torch import for transformer model
+try:
+    import torch
+    from model import create_model
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    torch = None
 
 # 24 proper rotations (no reflections) of the cube as axis permutations with sign flips.
 def _generate_cube_rotations() -> List[Tuple[Tuple[int, int, int], Tuple[int, int, int]]]:
@@ -229,6 +238,47 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def load_transformer_model(checkpoint_path: Path, device: torch.device) -> Optional[torch.nn.Module]:
+    """Load transformer model from checkpoint.
+    
+    Args:
+        checkpoint_path: Path to model checkpoint
+        device: Device to load model on
+        
+    Returns:
+        Loaded model or None if loading fails
+    """
+    if not TORCH_AVAILABLE:
+        print("PyTorch not available. Transformer mode disabled.")
+        return None
+    
+    if not checkpoint_path.exists():
+        print(f"Model checkpoint not found: {checkpoint_path}")
+        print("Transformer mode disabled. Train a model first using train.py")
+        return None
+    
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model = create_model(
+            grid_size=32,
+            patch_size=4,
+            embed_dim=128,
+            num_layers=6,
+            num_heads=8,
+        )
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model = model.to(device)
+        model.eval()
+        print(f"Loaded transformer model from {checkpoint_path}")
+        print(f"  Trained for {checkpoint['epoch']} epochs")
+        print(f"  Val loss: {checkpoint['val_loss']:.6f}")
+        return model
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        print("Transformer mode disabled.")
+        return None
+
+
 def main(mesh_path: Path) -> None:
     dims = (32, 32, 32)
     bound_low = (-0.5, -0.5, -0.5)
@@ -249,6 +299,17 @@ def main(mesh_path: Path) -> None:
     )
     sdf = distances.reshape(dims)
 
+    # Try to load transformer model
+    checkpoint_path = Path(__file__).resolve().parent / "checkpoints" / "best_model.pth"
+    device = torch.device("cpu")
+    if TORCH_AVAILABLE:
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+    
+    transformer_model = load_transformer_model(checkpoint_path, device)
+
     iter_grid = np.random.uniform(-1.0, 1.0, size=dims)
     state: Dict[str, Any] = {
         "mapping": None,
@@ -256,6 +317,9 @@ def main(mesh_path: Path) -> None:
         "last_compress_ms": None,
         "last_mse": None,
         "last_max_err": None,
+        "transformer_model": transformer_model,
+        "device": device,
+        "use_transformer": False,  # Default to classical mode
     }
 
     ps.init()
@@ -287,6 +351,24 @@ def main(mesh_path: Path) -> None:
     update_iter_visual(enabled=True)
 
     def ui_callback() -> None:
+        # Mode selection
+        psim.TextUnformatted("=== Mode Selection ===")
+        if state["transformer_model"] is not None:
+            changed, state["use_transformer"] = psim.Checkbox(
+                "Use Transformer Model", state["use_transformer"]
+            )
+            if changed:
+                mode_name = "Transformer" if state["use_transformer"] else "Classical Fractal Code"
+                print(f"Switched to {mode_name} mode")
+        else:
+            psim.TextUnformatted("Transformer: Not Available")
+            state["use_transformer"] = False
+        
+        # Display current mode with color
+        current_mode = "Transformer Model" if state["use_transformer"] else "Classical Fractal Code"
+        psim.TextUnformatted(f"Active Mode: {current_mode}")
+        psim.Separator()
+        
         if psim.Button("Compress"):
             start = time.perf_counter()
             state["mapping"] = compute_partitioned_ifs(
@@ -313,16 +395,36 @@ def main(mesh_path: Path) -> None:
             print(f"Saved fractal code to {save_path}")
 
         if psim.Button("Iterate once"):
-            if state["mapping"] is None:
-                print("Please run Compress before iterating.")
+            if state["use_transformer"]:
+                # Use transformer model
+                if state["transformer_model"] is None:
+                    print("Transformer model not loaded. Please train a model first.")
+                else:
+                    input_tensor = torch.from_numpy(state["iter_grid"].astype(np.float32))
+                    input_tensor = input_tensor.unsqueeze(0).to(state["device"])
+                    
+                    with torch.no_grad():
+                        output_tensor = state["transformer_model"](input_tensor)
+                    
+                    state["iter_grid"] = output_tensor.squeeze(0).cpu().numpy()
+                    update_iter_visual(enabled=True)
+                    diff = state["iter_grid"] - sdf
+                    state["last_mse"] = float(np.mean(diff ** 2))
+                    state["last_max_err"] = float(np.max(np.abs(diff)))
+                    print(f"Applied transformer iteration. MSE: {state['last_mse']:.6f}")
             else:
-                state["iter_grid"] = apply_partitioned_ifs(
-                    state["iter_grid"], state["mapping"]
-                )
-                update_iter_visual(enabled=True)
-                diff = state["iter_grid"] - sdf
-                state["last_mse"] = float(np.mean(diff ** 2))
-                state["last_max_err"] = float(np.max(np.abs(diff)))
+                # Use classical fractal code
+                if state["mapping"] is None:
+                    print("Please run Compress before iterating.")
+                else:
+                    state["iter_grid"] = apply_partitioned_ifs(
+                        state["iter_grid"], state["mapping"]
+                    )
+                    update_iter_visual(enabled=True)
+                    diff = state["iter_grid"] - sdf
+                    state["last_mse"] = float(np.mean(diff ** 2))
+                    state["last_max_err"] = float(np.max(np.abs(diff)))
+                    print(f"Applied classical iteration. MSE: {state['last_mse']:.6f}")
 
         if psim.Button("Reset"):
             state["iter_grid"] = np.random.uniform(-1.0, 1.0, size=dims)
@@ -331,6 +433,7 @@ def main(mesh_path: Path) -> None:
             state["last_max_err"] = None
             print("Reset iter grid.")
 
+        psim.Separator()
         if state["last_compress_ms"] is None:
             psim.Text("Last compress: (not run yet)")
         else:
