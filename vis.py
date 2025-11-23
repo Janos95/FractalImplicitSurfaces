@@ -226,19 +226,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mesh",
         type=Path,
-        default=Path(__file__).resolve().parent / "spot.obj",
-        help="Path to mesh to use for SDF (default: spot.obj next to vis.py)",
+        default=Path(__file__).resolve().parent / "armadillo.obj",
+        help="Path to mesh to use for SDF (default: armadillo.obj next to vis.py)",
     )
     return parser.parse_args()
 
 
 def main(mesh_path: Path) -> None:
-    dims = (32, 32, 32)
+    dims = (NN_GRID_SIZE, NN_GRID_SIZE, NN_GRID_SIZE)
     bound_low = (-0.5, -0.5, -0.5)
     bound_high = (0.5, 0.5, 0.5)
-
-    if dims[0] != NN_GRID_SIZE:
-        raise ValueError(f"Neural PIFS grid size ({NN_GRID_SIZE}) does not match viewer grid ({dims[0]}).")
 
     if not mesh_path.exists():
         raise FileNotFoundError(f"Mesh not found: {mesh_path}")
@@ -264,7 +261,7 @@ def main(mesh_path: Path) -> None:
         "last_max_err": None,
         "neural_model": None,
     }
-    neural_checkpoint = Path(__file__).resolve().parent / "fractal_attention_sdf.pt"
+    neural_checkpoint = Path(__file__).resolve().parent / "fractal_attention_armadillo.pt"
 
     ps.init()
     ps_grid = ps.register_volume_grid("spot sdf", dims, bound_low, bound_high)
@@ -295,7 +292,7 @@ def main(mesh_path: Path) -> None:
     update_iter_visual(enabled=True)
 
     def ui_callback() -> None:
-        if psim.Button("Compress"):
+        if psim.Button("Classical compress"):
             start = time.perf_counter()
             state["mapping"] = compute_partitioned_ifs(
                 sdf,
@@ -305,20 +302,6 @@ def main(mesh_path: Path) -> None:
             elapsed_ms = (time.perf_counter() - start) * 1000.0
             state["last_compress_ms"] = elapsed_ms
             print(f"Computed partitioned IFS mapping in {elapsed_ms:.2f} ms.")
-            
-            # Save fractal code to disk
-            mapping = state["mapping"]
-            save_path = Path(__file__).resolve().parent / "fractal_code.npz"
-            np.savez_compressed(
-                save_path,
-                range_block_size=mapping["range_block_size"],
-                domain_block_size=mapping["domain_block_size"],
-                best_domain_idx=mapping["best_domain_idx"],
-                best_sym_idx=mapping["best_sym_idx"],
-                scale=mapping["scale"],
-                offset=mapping["offset"],
-            )
-            print(f"Saved fractal code to {save_path}")
 
         if psim.Button("Reset"):
             state["iter_grid"] = np.random.uniform(-1.0, 1.0, size=dims)
