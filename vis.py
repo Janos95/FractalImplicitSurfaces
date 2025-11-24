@@ -1,16 +1,46 @@
 import argparse
+import time
 from itertools import permutations, product
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
-
-import igl
+from typing import Any, Dict, List, Sequence, Tuple, Union
 import numpy as np
 import polyscope as ps
 import polyscope.imgui as psim
-import time
 import torch
 
-from train import GRID_SIZE as NN_GRID_SIZE, collage_once as neural_collage_once, load_model
+from train import EMBEDDING_DIM, GridConfig, collage_once as neural_collage_once, compute_sdf, FractalAttention3D
+
+DEFAULT_CHECKPOINT = Path(__file__).resolve().parent / "spot_32.pt"
+
+
+def _extract_state_dict(state: dict) -> dict:
+    for key in ("state_dict", "model_state_dict", "model_state"):
+        if key in state and isinstance(state[key], dict):
+            return state[key]
+    if not isinstance(state, dict):
+        raise ValueError("Unexpected checkpoint format; expected a state dict or a container holding one.")
+    return state
+
+
+def load_model_from_checkpoint(
+    checkpoint_path: Path,
+    map_location: Union[str, torch.device] = "cpu",
+) -> tuple[FractalAttention3D, GridConfig, Path]:
+    state = torch.load(checkpoint_path, map_location=map_location)
+    state_dict = _extract_state_dict(state)
+
+    if "grid_size" not in state or "mesh_path" not in state:
+        raise ValueError("Checkpoint is missing grid_size or mesh_path metadata.")
+
+    mesh_path = Path(state["mesh_path"])
+    config = GridConfig(grid_size=int(state["grid_size"]))
+
+    range_positional = torch.zeros(config.num_range_blocks, EMBEDDING_DIM, device=map_location)
+    domain_positional = torch.zeros(config.num_domain_blocks, EMBEDDING_DIM, device=map_location)
+    model = FractalAttention3D(config, range_positional, domain_positional)
+    model.load_state_dict(state_dict)
+    model.eval()
+    return model, config, mesh_path
 
 # 24 proper rotations (no reflections) of the cube as axis permutations with sign flips.
 def _generate_cube_rotations() -> List[Tuple[Tuple[int, int, int], Tuple[int, int, int]]]:
@@ -224,33 +254,29 @@ def apply_partitioned_ifs(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Polyscope IFS demo")
     parser.add_argument(
-        "--mesh",
+        "--checkpoint",
         type=Path,
-        default=Path(__file__).resolve().parent / "armadillo.obj",
-        help="Path to mesh to use for SDF (default: armadillo.obj next to vis.py)",
+        default=DEFAULT_CHECKPOINT,
+        help="Path to trained checkpoint (default: spot_32.pt next to vis.py)",
     )
     return parser.parse_args()
 
 
-def main(mesh_path: Path) -> None:
-    dims = (NN_GRID_SIZE, NN_GRID_SIZE, NN_GRID_SIZE)
+def main(checkpoint_path: Path) -> None:
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    model, config, mesh_path = load_model_from_checkpoint(checkpoint_path, map_location="cpu")
+
+    dims = (config.grid_size, config.grid_size, config.grid_size)
     bound_low = (-0.5, -0.5, -0.5)
     bound_high = (0.5, 0.5, 0.5)
 
     if not mesh_path.exists():
-        raise FileNotFoundError(f"Mesh not found: {mesh_path}")
+        raise FileNotFoundError(f"Mesh from checkpoint metadata not found: {mesh_path}")
 
-    V, F = igl.read_triangle_mesh(str(mesh_path))
-    V = mesh_to_unit_bounds(V, bound_half_extent=bound_high[0])
-
-    sample_pts = sample_grid_points(dims, bound_low, bound_high)
-    distances, _, _, _ = igl.signed_distance(
-        sample_pts,
-        V,
-        F,
-        igl.SIGNED_DISTANCE_TYPE_FAST_WINDING_NUMBER,
-    )
-    sdf = distances.reshape(dims)
+    sdf_cache = checkpoint_path.with_suffix(".sdf.npy")
+    sdf = compute_sdf(mesh_path, sdf_cache, config.grid_size)
 
     iter_grid = np.random.uniform(-1.0, 1.0, size=dims)
     state: Dict[str, Any] = {
@@ -259,16 +285,15 @@ def main(mesh_path: Path) -> None:
         "last_compress_ms": None,
         "last_mse": None,
         "last_max_err": None,
-        "neural_model": None,
+        "neural_model": model,
     }
-    neural_checkpoint = Path(__file__).resolve().parent / "fractal_attention_armadillo.pt"
 
     ps.init()
-    ps_grid = ps.register_volume_grid("spot sdf", dims, bound_low, bound_high)
+    ps_grid = ps.register_volume_grid(f"{mesh_path.stem} sdf", dims, bound_low, bound_high)
     ps_iter_grid = ps.register_volume_grid("iter grid", dims, bound_low, bound_high)
 
     ps_grid.add_scalar_quantity(
-        "spot signed distance",
+        "signed distance",
         sdf,
         defined_on="nodes",
         enable_isosurface_viz=True,
@@ -325,27 +350,18 @@ def main(mesh_path: Path) -> None:
                 print(f"Applied classical iteration. MSE: {state['last_mse']:.6f}")
 
         if psim.Button("Iterate neural"):
-            if not neural_checkpoint.exists():
-                print(f"Neural checkpoint not found at {neural_checkpoint}; ignoring button press.")
+            if state["neural_model"] is None:
+                print("Neural model not loaded; cannot iterate.")
             else:
-                if state["neural_model"] is None:
-                    try:
-                        state["neural_model"] = load_model(neural_checkpoint, map_location="cpu")
-                        print(f"Loaded neural model from {neural_checkpoint}")
-                    except Exception as exc:
-                        state["neural_model"] = None
-                        print(f"Failed to load neural model: {exc}")
-
-                if state["neural_model"] is not None:
-                    grid_t = torch.from_numpy(state["iter_grid"]).to(torch.float32)
-                    with torch.no_grad():
-                        updated = neural_collage_once(state["neural_model"], grid_t)
-                    state["iter_grid"] = updated.cpu().numpy()
-                    update_iter_visual(enabled=True)
-                    diff = state["iter_grid"] - sdf
-                    state["last_mse"] = float(np.mean(diff ** 2))
-                    state["last_max_err"] = float(np.max(np.abs(diff)))
-                    print(f"Applied neural iteration. MSE: {state['last_mse']:.6f}")
+                grid_t = torch.from_numpy(state["iter_grid"]).to(torch.float32)
+                with torch.no_grad():
+                    updated = neural_collage_once(state["neural_model"], grid_t)
+                state["iter_grid"] = updated.cpu().numpy()
+                update_iter_visual(enabled=True)
+                diff = state["iter_grid"] - sdf
+                state["last_mse"] = float(np.mean(diff ** 2))
+                state["last_max_err"] = float(np.max(np.abs(diff)))
+                print(f"Applied neural iteration. MSE: {state['last_mse']:.6f}")
 
         psim.Separator()
         if state["last_compress_ms"] is None:
@@ -369,4 +385,4 @@ def main(mesh_path: Path) -> None:
 
 if __name__ == "__main__":
     args = parse_args()
-    main(args.mesh)
+    main(args.checkpoint)

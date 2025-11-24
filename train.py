@@ -1,7 +1,8 @@
 import argparse
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Tuple
 
 import igl
 import numpy as np
@@ -15,20 +16,40 @@ MAX_CONTRAST = 1.8
 SOFTMAX_TEMPERATURE = 0.25
 
 # Grid/block configuration.
-GRID_SIZE = 128
+DEFAULT_GRID_SIZE = 32
 RANGE_SIZE = 4
 DOMAIN_SIZE = 8
-NUM_RANGE_BLOCKS = (GRID_SIZE // RANGE_SIZE) ** 3  # 8^3 = 512
-NUM_DOMAIN_BLOCKS = (GRID_SIZE // DOMAIN_SIZE) ** 3  # 4^3 = 64
 
 # Paths/seeds.
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MESH = SCRIPT_DIR / "spot.obj"
 DEFAULT_SDF_CACHE = SCRIPT_DIR / "spot_sdf.npy"
-DEFAULT_CHECKPOINT = SCRIPT_DIR / "fractal_attention_sdf.pt"
+DEFAULT_CHECKPOINT = SCRIPT_DIR / "spot_32.pt"
 DEFAULT_NUM_EPOCHS = 1200
 DEFAULT_LR = 1e-3
 SEED = 1337
+
+@dataclass(frozen=True)
+class GridConfig:
+    grid_size: int
+    range_size: int = RANGE_SIZE
+    domain_size: int = DOMAIN_SIZE
+
+    def __post_init__(self) -> None:
+        if self.domain_size != self.range_size * 2:
+            raise ValueError("Domain block size must be twice the range block size for pooling to work.")
+        if self.grid_size % self.range_size != 0:
+            raise ValueError(f"Grid size {self.grid_size} must be divisible by range block size {self.range_size}.")
+        if self.grid_size % self.domain_size != 0:
+            raise ValueError(f"Grid size {self.grid_size} must be divisible by domain block size {self.domain_size}.")
+
+    @property
+    def num_range_blocks(self) -> int:
+        return (self.grid_size // self.range_size) ** 3
+
+    @property
+    def num_domain_blocks(self) -> int:
+        return (self.grid_size // self.domain_size) ** 3
 
 
 def select_device(prefer_gpu: bool = True) -> torch.device:
@@ -60,10 +81,10 @@ def sample_grid_points(dims: Tuple[int, int, int], bound_low, bound_high) -> np.
     return np.stack(grid, axis=-1).reshape(-1, 3)
 
 
-def compute_sdf(mesh_path: Path, cache_path: Path) -> np.ndarray:
+def compute_sdf(mesh_path: Path, cache_path: Path, grid_size: int) -> np.ndarray:
     if cache_path.exists():
         sdf = np.load(cache_path)
-        if sdf.shape == (GRID_SIZE, GRID_SIZE, GRID_SIZE):
+        if sdf.shape == (grid_size, grid_size, grid_size):
             print(f"Loaded cached SDF from {cache_path}")
             return sdf.astype(np.float32)
         else:
@@ -71,7 +92,7 @@ def compute_sdf(mesh_path: Path, cache_path: Path) -> np.ndarray:
 
     bound_low = (-0.5, -0.5, -0.5)
     bound_high = (0.5, 0.5, 0.5)
-    dims = (GRID_SIZE, GRID_SIZE, GRID_SIZE)
+    dims = (grid_size, grid_size, grid_size)
 
     if not mesh_path.exists():
         raise FileNotFoundError(f"Mesh not found: {mesh_path}")
@@ -128,15 +149,25 @@ def reassemble_blocks_3d(blocks: torch.Tensor, grid_size: int) -> torch.Tensor:
 
 
 class FractalAttention3D(torch.nn.Module):
-    def __init__(self, range_positional: torch.Tensor, domain_positional: torch.Tensor) -> None:
+    def __init__(
+        self,
+        config: GridConfig,
+        range_positional: torch.Tensor,
+        domain_positional: torch.Tensor,
+    ) -> None:
         super().__init__()
+        self.config = config
+        if range_positional.shape[0] != config.num_range_blocks:
+            raise ValueError("Range positional embedding shape does not match grid configuration.")
+        if domain_positional.shape[0] != config.num_domain_blocks:
+            raise ValueError("Domain positional embedding shape does not match grid configuration.")
         self.register_parameter(
             "range_latents",
-            torch.nn.Parameter(torch.randn(NUM_RANGE_BLOCKS, EMBEDDING_DIM)),
+            torch.nn.Parameter(torch.randn(config.num_range_blocks, EMBEDDING_DIM)),
         )
         self.register_parameter(
             "domain_latents",
-            torch.nn.Parameter(torch.randn(NUM_DOMAIN_BLOCKS, EMBEDDING_DIM)),
+            torch.nn.Parameter(torch.randn(config.num_domain_blocks, EMBEDDING_DIM)),
         )
         self.register_buffer("range_positional", range_positional)
         self.register_buffer("domain_positional", domain_positional)
@@ -167,17 +198,19 @@ class FractalAttention3D(torch.nn.Module):
         logits = (range_repr @ domain_repr.t()) / (range_repr.shape[-1] ** 0.5 * SOFTMAX_TEMPERATURE)
         weights = torch.softmax(logits, dim=-1)
 
-        domain_flat = pooled_domains.view(NUM_DOMAIN_BLOCKS, -1)
+        domain_flat = pooled_domains.view(self.config.num_domain_blocks, -1)
         scaled_domains = torch.matmul(weights * contrast, domain_flat)
         offset_effective = (weights * offset).sum(dim=1, keepdim=True)
-        decoded = (scaled_domains + offset_effective).view(-1, RANGE_SIZE, RANGE_SIZE, RANGE_SIZE)
+        decoded = (scaled_domains + offset_effective).view(
+            -1, self.config.range_size, self.config.range_size, self.config.range_size
+        )
         return decoded
 
 
 def collage_once(model: FractalAttention3D, source_grid: torch.Tensor) -> torch.Tensor:
-    pooled = get_pooled_blocks_3d(source_grid, RANGE_SIZE)
+    pooled = get_pooled_blocks_3d(source_grid, model.config.range_size)
     blocks = model(pooled)
-    return reassemble_blocks_3d(blocks, GRID_SIZE)
+    return reassemble_blocks_3d(blocks, model.config.grid_size)
 
 
 def fmt(value: float) -> str:
@@ -202,7 +235,7 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint",
         type=Path,
         default=DEFAULT_CHECKPOINT,
-        help="Where to save the trained model (default: fractal_attention_sdf.pt).",
+        help="Where to save the trained model (default: spot_32.pt).",
     )
     parser.add_argument(
         "--num-epochs",
@@ -215,6 +248,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_LR,
         help="Optimizer learning rate.",
+    )
+    parser.add_argument(
+        "--grid-size",
+        type=int,
+        default=DEFAULT_GRID_SIZE,
+        help="Resolution of the cubic SDF grid (must be divisible by 8).",
     )
     parser.add_argument(
         "--cpu",
@@ -233,15 +272,17 @@ def train(args: argparse.Namespace) -> None:
     elif device.type == "mps":
         torch.mps.manual_seed(SEED)  # type: ignore[attr-defined]
 
-    sdf_np = compute_sdf(args.mesh, args.sdf_cache)
+    config = GridConfig(grid_size=args.grid_size)
+
+    sdf_np = compute_sdf(args.mesh, args.sdf_cache, config.grid_size)
     sdf = torch.from_numpy(sdf_np).to(device)
 
-    range_blocks = get_blocks_3d(sdf, RANGE_SIZE)
-    pooled_domains = get_pooled_blocks_3d(sdf, RANGE_SIZE)
-    range_positional = torch.zeros(NUM_RANGE_BLOCKS, EMBEDDING_DIM, device=device)
-    domain_positional = torch.zeros(NUM_DOMAIN_BLOCKS, EMBEDDING_DIM, device=device)
+    range_blocks = get_blocks_3d(sdf, config.range_size)
+    pooled_domains = get_pooled_blocks_3d(sdf, config.range_size)
+    range_positional = torch.zeros(config.num_range_blocks, EMBEDDING_DIM, device=device)
+    domain_positional = torch.zeros(config.num_domain_blocks, EMBEDDING_DIM, device=device)
 
-    model = FractalAttention3D(range_positional, domain_positional).to(device)
+    model = FractalAttention3D(config, range_positional, domain_positional).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
     for epoch in range(args.num_epochs):
@@ -274,7 +315,7 @@ def train(args: argparse.Namespace) -> None:
         median_error = float(per_block_mse.median().item())
 
         rng = torch.Generator(device=device).manual_seed(42)
-        iter_grid = torch.empty((GRID_SIZE, GRID_SIZE, GRID_SIZE), device=device)
+        iter_grid = torch.empty((config.grid_size, config.grid_size, config.grid_size), device=device)
         iter_grid.uniform_(-1.0, 1.0, generator=rng)
         for _ in range(16):
             iter_grid = evaluate_once(iter_grid)
@@ -282,25 +323,19 @@ def train(args: argparse.Namespace) -> None:
         iter_mse = float((iter_grid - sdf).pow(2).mean().item())
 
     args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(model.state_dict(), args.checkpoint)
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "grid_size": config.grid_size,
+            "mesh_path": str(args.mesh.resolve()),
+        },
+        args.checkpoint,
+    )
 
     print(f"Mean block MSE: {fmt(mean_error)}")
     print(f"Median block MSE: {fmt(median_error)}")
     print(f"MSE after 16 iterations vs SDF: {fmt(iter_mse)}")
     print(f"Saved checkpoint to {args.checkpoint}")
-
-
-def load_model(
-    checkpoint_path: Path,
-    map_location: Optional[Union[torch.device, str]] = None,
-) -> FractalAttention3D:
-    range_positional = torch.zeros(NUM_RANGE_BLOCKS, EMBEDDING_DIM, device=map_location or "cpu")
-    domain_positional = torch.zeros(NUM_DOMAIN_BLOCKS, EMBEDDING_DIM, device=map_location or "cpu")
-    model = FractalAttention3D(range_positional, domain_positional)
-    state = torch.load(checkpoint_path, map_location=map_location)
-    model.load_state_dict(state)
-    model.eval()
-    return model
 
 
 def main() -> None:
