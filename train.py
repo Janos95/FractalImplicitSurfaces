@@ -12,7 +12,8 @@ import torch
 EMBEDDING_DIM = 512
 ATTENTION_DIM = 256
 AFFINE_HIDDEN_DIM = 128
-MAX_CONTRAST = 1.8
+# Must stay below sqrt(8) so the map remains contractive; domain pooling is 1/sqrt(8) Lipschitz.
+MAX_AFFINE_SCALE = 2.5
 SOFTMAX_TEMPERATURE = 0.25
 
 # Grid/block configuration.
@@ -180,7 +181,7 @@ class FractalAttention3D(torch.nn.Module):
         range_contrast = self.range_contrast_proj(range_base)
         domain_contrast = self.domain_contrast_proj(domain_base)
         contrast_logits = (range_contrast @ domain_contrast.t()) / AFFINE_HIDDEN_DIM**0.5
-        contrast = torch.tanh(contrast_logits) * MAX_CONTRAST
+        contrast = torch.tanh(contrast_logits) * MAX_AFFINE_SCALE
 
         range_offset = self.range_offset_proj(range_base)
         domain_offset = self.domain_offset_proj(domain_base)
