@@ -1,1 +1,6 @@
 __pycache__/
+.venv/
+*.pt
+*.npy
+*.npz
+*.ini

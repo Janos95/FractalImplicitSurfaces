@@ -152,15 +152,9 @@ class FractalAttention3D(torch.nn.Module):
     def __init__(
         self,
         config: GridConfig,
-        range_positional: torch.Tensor,
-        domain_positional: torch.Tensor,
     ) -> None:
         super().__init__()
         self.config = config
-        if range_positional.shape[0] != config.num_range_blocks:
-            raise ValueError("Range positional embedding shape does not match grid configuration.")
-        if domain_positional.shape[0] != config.num_domain_blocks:
-            raise ValueError("Domain positional embedding shape does not match grid configuration.")
         self.register_parameter(
             "range_latents",
             torch.nn.Parameter(torch.randn(config.num_range_blocks, EMBEDDING_DIM)),
@@ -169,8 +163,6 @@ class FractalAttention3D(torch.nn.Module):
             "domain_latents",
             torch.nn.Parameter(torch.randn(config.num_domain_blocks, EMBEDDING_DIM)),
         )
-        self.register_buffer("range_positional", range_positional)
-        self.register_buffer("domain_positional", domain_positional)
         self.range_proj = torch.nn.Linear(EMBEDDING_DIM, ATTENTION_DIM)
         self.domain_proj = torch.nn.Linear(EMBEDDING_DIM, ATTENTION_DIM)
         self.range_contrast_proj = torch.nn.Linear(EMBEDDING_DIM, AFFINE_HIDDEN_DIM)
@@ -179,8 +171,8 @@ class FractalAttention3D(torch.nn.Module):
         self.domain_offset_proj = torch.nn.Linear(EMBEDDING_DIM, AFFINE_HIDDEN_DIM)
 
     def forward(self, pooled_domains: torch.Tensor) -> torch.Tensor:
-        range_base = self.range_latents + self.range_positional
-        domain_base = self.domain_latents + self.domain_positional
+        range_base = self.range_latents
+        domain_base = self.domain_latents
 
         range_repr = self.range_proj(range_base)
         domain_repr = self.domain_proj(domain_base)
@@ -279,10 +271,7 @@ def train(args: argparse.Namespace) -> None:
 
     range_blocks = get_blocks_3d(sdf, config.range_size)
     pooled_domains = get_pooled_blocks_3d(sdf, config.range_size)
-    range_positional = torch.zeros(config.num_range_blocks, EMBEDDING_DIM, device=device)
-    domain_positional = torch.zeros(config.num_domain_blocks, EMBEDDING_DIM, device=device)
-
-    model = FractalAttention3D(config, range_positional, domain_positional).to(device)
+    model = FractalAttention3D(config).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
     for epoch in range(args.num_epochs):
@@ -304,10 +293,6 @@ def train(args: argparse.Namespace) -> None:
 
     model.eval()
 
-    def evaluate_once(source_grid: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            return collage_once(model, source_grid)
-
     with torch.no_grad():
         final_blocks = model(pooled_domains)
         per_block_mse = (final_blocks - range_blocks).pow(2).mean(dim=(1, 2, 3))
@@ -318,7 +303,7 @@ def train(args: argparse.Namespace) -> None:
         iter_grid = torch.empty((config.grid_size, config.grid_size, config.grid_size), device=device)
         iter_grid.uniform_(-1.0, 1.0, generator=rng)
         for _ in range(16):
-            iter_grid = evaluate_once(iter_grid)
+            iter_grid = collage_once(model, iter_grid)
 
         iter_mse = float((iter_grid - sdf).pow(2).mean().item())
 
