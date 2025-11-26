@@ -1,6 +1,6 @@
 import argparse
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Tuple
 
@@ -17,8 +17,6 @@ SOFTMAX_TEMPERATURE = 0.25
 
 # Grid/block configuration.
 DEFAULT_GRID_SIZE = 32
-RANGE_SIZE = 4
-DOMAIN_SIZE = 8
 
 # Paths/seeds.
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -32,16 +30,18 @@ SEED = 1337
 @dataclass(frozen=True)
 class GridConfig:
     grid_size: int
-    range_size: int = RANGE_SIZE
-    domain_size: int = DOMAIN_SIZE
+    range_size: int = field(init=False)
+    domain_size: int = field(init=False)
 
     def __post_init__(self) -> None:
+        if self.grid_size % 8 != 0:
+            raise ValueError(f"Grid size {self.grid_size} must be divisible by 8 for range blocks.")
+        if self.grid_size % 4 != 0:
+            raise ValueError(f"Grid size {self.grid_size} must be divisible by 4 for domain blocks.")
+        object.__setattr__(self, "range_size", self.grid_size // 8)
+        object.__setattr__(self, "domain_size", self.grid_size // 4)
         if self.domain_size != self.range_size * 2:
             raise ValueError("Domain block size must be twice the range block size for pooling to work.")
-        if self.grid_size % self.range_size != 0:
-            raise ValueError(f"Grid size {self.grid_size} must be divisible by range block size {self.range_size}.")
-        if self.grid_size % self.domain_size != 0:
-            raise ValueError(f"Grid size {self.grid_size} must be divisible by domain block size {self.domain_size}.")
 
     @property
     def num_range_blocks(self) -> int:

@@ -35,9 +35,7 @@ def load_model_from_checkpoint(
     mesh_path = Path(state["mesh_path"])
     config = GridConfig(grid_size=int(state["grid_size"]))
 
-    range_positional = torch.zeros(config.num_range_blocks, EMBEDDING_DIM, device=map_location)
-    domain_positional = torch.zeros(config.num_domain_blocks, EMBEDDING_DIM, device=map_location)
-    model = FractalAttention3D(config, range_positional, domain_positional)
+    model = FractalAttention3D(config)
     model.load_state_dict(state_dict)
     model.eval()
     return model, config, mesh_path
@@ -267,6 +265,8 @@ def main(checkpoint_path: Path) -> None:
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
     model, config, mesh_path = load_model_from_checkpoint(checkpoint_path, map_location="cpu")
+    range_block_size = config.range_size
+    domain_block_size = config.domain_size
 
     dims = (config.grid_size, config.grid_size, config.grid_size)
     bound_low = (-0.5, -0.5, -0.5)
@@ -321,8 +321,8 @@ def main(checkpoint_path: Path) -> None:
             start = time.perf_counter()
             state["mapping"] = compute_partitioned_ifs(
                 sdf,
-                range_block_size=4,
-                domain_block_size=8,
+                range_block_size=range_block_size,
+                domain_block_size=domain_block_size,
             )
             elapsed_ms = (time.perf_counter() - start) * 1000.0
             state["last_compress_ms"] = elapsed_ms
